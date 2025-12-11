@@ -3,6 +3,7 @@ Source Google Tasks - Récupère les tâches depuis Google Tasks.
 Utilise l'API Google Tasks avec OAuth2.
 """
 
+import logging
 import pickle
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +11,9 @@ from typing import Optional
 
 from src.inputs.base_input import BaseInput, InputError, InputRegistry
 from src.processing.models import Task, TaskList, Priority, TaskStatus
+from src.utils.resilience import with_retry, RetryConfig, classify_error, ErrorSeverity
+
+logger = logging.getLogger("kanbanprinter.google_tasks")
 
 
 class GoogleTasksInput(BaseInput):
@@ -85,18 +89,33 @@ class GoogleTasksInput(BaseInput):
         
         # Charger le token existant
         if self.token_path.exists():
-            with open(self.token_path, "rb") as token:
-                creds = pickle.load(token)
+            try:
+                with open(self.token_path, "rb") as token:
+                    creds = pickle.load(token)
+            except Exception as e:
+                logger.warning(f"Erreur lecture token {self.account_name}: {e}")
+                creds = None
         
         # Rafraîchir ou créer le token
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 try:
                     creds.refresh(Request())
-                except Exception:
+                    logger.info(f"Token Google Tasks '{self.account_name}' rafraîchi")
+                except Exception as e:
+                    logger.warning(f"Échec refresh token '{self.account_name}': {e}")
                     creds = None
             
             if not creds:
+                # Vérifier si on est en mode interactif
+                import sys
+                if not sys.stdin.isatty():
+                    self._last_error = (
+                        f"Token absent/invalide pour '{self.account_name}'. "
+                        "Exécutez le script en mode interactif pour autoriser."
+                    )
+                    return False
+                
                 try:
                     flow = InstalledAppFlow.from_client_secrets_file(
                         str(self.credentials_path), self.SCOPES
@@ -107,28 +126,60 @@ class GoogleTasksInput(BaseInput):
                     return False
             
             # Sauvegarder le token
-            self.token_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.token_path, "wb") as token:
-                pickle.dump(creds, token)
+            if creds:
+                try:
+                    self.token_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(self.token_path, "wb") as token:
+                        pickle.dump(creds, token)
+                except Exception as e:
+                    logger.warning(f"Impossible de sauvegarder le token: {e}")
         
         # Créer le service Google Tasks
         try:
             self._service = build("tasks", "v1", credentials=creds)
             self._connected = True
+            self._creds = creds  # Garder une référence pour refresh
             return True
         except Exception as e:
             self._last_error = f"Erreur création service Google Tasks: {e}"
             return False
+    
+    def _refresh_credentials_if_needed(self) -> bool:
+        """Rafraîchit les credentials si nécessaire (pour les longues sessions)."""
+        if not hasattr(self, '_creds') or not self._creds:
+            return False
+        
+        try:
+            if self._creds.expired and self._creds.refresh_token:
+                from google.auth.transport.requests import Request
+                self._creds.refresh(Request())
+                
+                # Sauvegarder le nouveau token
+                with open(self.token_path, "wb") as token:
+                    pickle.dump(self._creds, token)
+                
+                logger.info(f"Token Google Tasks '{self.account_name}' auto-rafraîchi")
+                return True
+        except Exception as e:
+            logger.error(f"Échec auto-refresh token: {e}")
+            self._connected = False
+            return False
+        
+        return True
     
     def fetch_tasks(self, limit: Optional[int] = None) -> TaskList:
         """Récupère les tâches depuis Google Tasks."""
         if not self._connected or not self._service:
             raise InputError("Non connecté à Google Tasks. Appelez connect() d'abord.")
         
+        # Rafraîchir les credentials si nécessaire
+        self._refresh_credentials_if_needed()
+        
         tasks = []
         
-        try:
-            # Récupérer les tâches
+        # Utiliser retry avec backoff pour les appels API
+        @with_retry(RetryConfig(max_retries=3, base_delay=2.0))
+        def _fetch_tasks_list():
             params = {
                 "tasklist": self.tasklist_id,
                 "showCompleted": self.include_completed,
@@ -136,17 +187,29 @@ class GoogleTasksInput(BaseInput):
             }
             if limit:
                 params["maxResults"] = limit
-            
-            results = self._service.tasks().list(**params).execute()
+            return self._service.tasks().list(**params).execute()
+        
+        try:
+            results = _fetch_tasks_list()
             items = results.get("items", [])
             
             for item in items:
-                task = self._parse_google_task(item)
-                if task:
-                    tasks.append(task)
+                try:
+                    task = self._parse_google_task(item)
+                    if task:
+                        tasks.append(task)
+                except Exception as e:
+                    logger.warning(f"Erreur parsing tâche {item.get('id')}: {e}")
                     
         except Exception as e:
-            raise InputError(f"Erreur récupération tâches: {e}")
+            severity = classify_error(e)
+            if severity == ErrorSeverity.TRANSIENT:
+                raise InputError(f"Erreur réseau Google Tasks (temporaire): {e}")
+            elif severity == ErrorSeverity.RECOVERABLE:
+                self._connected = False
+                raise InputError(f"Erreur auth Google Tasks: {e}")
+            else:
+                raise InputError(f"Erreur récupération tâches: {e}")
         
         return tasks
     

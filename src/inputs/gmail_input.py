@@ -5,8 +5,10 @@ Utilise l'API Gmail avec OAuth2.
 
 import base64
 import json
+import logging
 import pickle
 import re
+import time
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -14,6 +16,9 @@ from typing import Optional
 
 from src.inputs.base_input import BaseInput, InputError, InputRegistry
 from src.processing.models import Task, TaskList, Priority, TaskStatus
+from src.utils.resilience import with_retry, RetryConfig, classify_error, ErrorSeverity
+
+logger = logging.getLogger("kanbanprinter.gmail")
 
 
 class GmailInput(BaseInput):
@@ -89,18 +94,36 @@ class GmailInput(BaseInput):
         
         # Charger le token existant
         if self.token_path.exists():
-            with open(self.token_path, "rb") as token:
-                creds = pickle.load(token)
+            try:
+                with open(self.token_path, "rb") as token:
+                    creds = pickle.load(token)
+            except Exception as e:
+                logger.warning(f"Erreur lecture token {self.account_name}: {e}")
+                creds = None
         
         # Rafraîchir ou créer le token
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 try:
                     creds.refresh(Request())
-                except Exception:
+                    logger.info(f"Token Gmail '{self.account_name}' rafraîchi")
+                except Exception as e:
+                    logger.warning(f"Échec refresh token '{self.account_name}': {e}")
+                    # En mode daemon, on ne peut pas demander une nouvelle auth
+                    # On garde l'erreur pour que le circuit breaker gère
+                    self._last_error = f"Token expiré, réauthentification nécessaire: {e}"
                     creds = None
             
             if not creds:
+                # Vérifier si on est en mode interactif (terminal disponible)
+                import sys
+                if not sys.stdin.isatty():
+                    self._last_error = (
+                        f"Token absent/invalide pour '{self.account_name}'. "
+                        "Exécutez le script en mode interactif pour autoriser."
+                    )
+                    return False
+                
                 try:
                     flow = InstalledAppFlow.from_client_secrets_file(
                         str(self.credentials_path), self.SCOPES
@@ -111,58 +134,107 @@ class GmailInput(BaseInput):
                     return False
             
             # Sauvegarder le token
-            self.token_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.token_path, "wb") as token:
-                pickle.dump(creds, token)
+            if creds:
+                try:
+                    self.token_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(self.token_path, "wb") as token:
+                        pickle.dump(creds, token)
+                except Exception as e:
+                    logger.warning(f"Impossible de sauvegarder le token: {e}")
         
         # Créer le service Gmail
         try:
             self._service = build("gmail", "v1", credentials=creds)
             self._connected = True
+            self._creds = creds  # Garder une référence pour refresh
             return True
         except Exception as e:
             self._last_error = f"Erreur création service Gmail: {e}"
             return False
+    
+    def _refresh_credentials_if_needed(self) -> bool:
+        """Rafraîchit les credentials si nécessaire (pour les longues sessions)."""
+        if not hasattr(self, '_creds') or not self._creds:
+            return False
+        
+        try:
+            if self._creds.expired and self._creds.refresh_token:
+                from google.auth.transport.requests import Request
+                self._creds.refresh(Request())
+                
+                # Sauvegarder le nouveau token
+                with open(self.token_path, "wb") as token:
+                    pickle.dump(self._creds, token)
+                
+                logger.info(f"Token Gmail '{self.account_name}' auto-rafraîchi")
+                return True
+        except Exception as e:
+            logger.error(f"Échec auto-refresh token: {e}")
+            self._connected = False
+            return False
+        
+        return True
     
     def fetch_tasks(self, limit: Optional[int] = None) -> TaskList:
         """Récupère les emails et les convertit en tâches."""
         if not self._connected or not self._service:
             raise InputError("Non connecté à Gmail. Appelez connect() d'abord.")
         
+        # Rafraîchir les credentials si nécessaire
+        self._refresh_credentials_if_needed()
+        
         limit = limit or self.max_emails
         tasks = []
         
-        try:
-            # Rechercher les emails
-            results = self._service.users().messages().list(
+        # Utiliser retry avec backoff pour les appels API
+        @with_retry(RetryConfig(max_retries=3, base_delay=2.0))
+        def _fetch_messages():
+            return self._service.users().messages().list(
                 userId="me",
                 q=self.query,
                 maxResults=limit
             ).execute()
-            
+        
+        try:
+            results = _fetch_messages()
             messages = results.get("messages", [])
             
             for msg_info in messages:
                 try:
-                    # Récupérer les détails de l'email
-                    msg = self._service.users().messages().get(
-                        userId="me",
-                        id=msg_info["id"],
-                        format="metadata",
-                        metadataHeaders=["From", "Subject", "Date"]
-                    ).execute()
-                    
-                    task = self._parse_email_to_task(msg)
+                    task = self._fetch_single_email(msg_info["id"])
                     if task:
                         tasks.append(task)
-                        
                 except Exception as e:
-                    print(f"⚠️ Erreur parsing email {msg_info['id']}: {e}")
+                    # Log mais continue avec les autres emails
+                    logger.warning(f"Erreur parsing email {msg_info['id']}: {e}")
             
         except Exception as e:
-            raise InputError(f"Erreur récupération emails: {e}")
+            severity = classify_error(e)
+            if severity == ErrorSeverity.TRANSIENT:
+                # Erreur réseau temporaire
+                raise InputError(f"Erreur réseau Gmail (temporaire): {e}")
+            elif severity == ErrorSeverity.RECOVERABLE:
+                # Token expiré ou problème d'auth
+                self._connected = False
+                raise InputError(f"Erreur auth Gmail: {e}")
+            else:
+                raise InputError(f"Erreur récupération emails: {e}")
         
         return tasks
+    
+    def _fetch_single_email(self, msg_id: str) -> Optional[Task]:
+        """Récupère un email avec retry."""
+        @with_retry(RetryConfig(max_retries=2, base_delay=1.0))
+        def _get_message():
+            return self._service.users().messages().get(
+                userId="me",
+                id=msg_id,
+                format="metadata",
+                metadataHeaders=["From", "Subject", "Date"]
+            ).execute()
+        
+        msg = _get_message()
+        return self._parse_email_to_task(msg)
     
     def _parse_email_to_task(self, msg: dict) -> Optional[Task]:
         """Convertit un email Gmail en Task."""

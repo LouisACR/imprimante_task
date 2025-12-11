@@ -109,11 +109,23 @@ class Task:
         
         Ce hash garantit qu'une même tâche source aura toujours le même ID,
         permettant d'éviter les réimpressions de tâches déjà traitées.
-        """
-        # Normaliser les entrées pour un hash stable
-        content = f"{self.source}|{self.id}|{self.title}|{self.description or ''}"
-        content = content.lower().strip()
         
+        Pour les emails extraits par LLM, utilise les données source originales
+        plus un index pour distinguer plusieurs tâches du même email.
+        """
+        # Pour les tâches extraites d'emails, utiliser les données source
+        if self.raw_data and self.raw_data.get("extracted_from_email"):
+            # Utiliser l'ID Gmail original et le sujet original
+            gmail_id = self.raw_data.get("gmail_id", "")
+            original_subject = self.raw_data.get("original_subject", "")
+            # Extraire l'index de la tâche depuis l'ID (ex: "gmail-pro-abc123-task1" -> "task1")
+            task_index = self.id.split("-")[-1] if "-task" in self.id else "task1"
+            content = f"{self.source}|{gmail_id}|{original_subject}|{task_index}"
+        else:
+            # Pour les autres sources, utiliser id + title + description
+            content = f"{self.source}|{self.id}|{self.title}|{self.description or ''}"
+        
+        content = content.lower().strip()
         hash_obj = hashlib.sha256(content.encode("utf-8"))
         return hash_obj.hexdigest()[:16]
 

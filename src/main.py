@@ -4,7 +4,11 @@ CLI pour analyser les tâches et imprimer les plus importantes.
 """
 
 import argparse
+import logging
+import signal
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +31,19 @@ from src.processing.llm_parser import LLMParser
 from src.output.label_generator import LabelGenerator
 from src.output.printer import Printer
 from src.storage.database import TaskDatabase
+from src.utils.resilience import health_monitor, safe_execute, classify_error, ErrorSeverity
+
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("kanbanprinter")
+
+# Supprimer les warnings inutiles
+logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class KanbanPrinter:
@@ -100,19 +117,43 @@ class KanbanPrinter:
         self.sources.append(source)
     
     def fetch_all_tasks(self) -> TaskList:
-        """Récupère les tâches de toutes les sources."""
+        """
+        Récupère les tâches de toutes les sources.
+        Utilise le circuit breaker pour éviter les sources en échec répété.
+        """
         all_tasks = []
         
         for source in self.sources:
+            source_name = source.source_name
+            
+            # Vérifier si la source est en "circuit ouvert" (trop d'échecs)
+            if health_monitor.should_skip(source_name):
+                health = health_monitor.get_health(source_name)
+                print(f"  ⏸️  {source_name}: désactivé temporairement (retry à {health.next_retry.strftime('%H:%M')})")
+                continue
+            
             try:
                 if source.connect():
                     tasks = source.fetch_tasks()
                     all_tasks.extend(tasks)
-                    print(f"  ✅ {source.source_name}: {len(tasks)} tâches")
+                    health_monitor.record_success(source_name)
+                    print(f"  ✅ {source_name}: {len(tasks)} tâches")
                 else:
-                    print(f"  ❌ {source.source_name}: {source.last_error}")
+                    error_msg = source.last_error or "Erreur de connexion"
+                    health_monitor.record_failure(source_name, error_msg)
+                    print(f"  ❌ {source_name}: {error_msg}")
+                    
             except Exception as e:
-                print(f"  ❌ {source.source_name}: {e}")
+                severity = classify_error(e)
+                health_monitor.record_failure(source_name, str(e))
+                
+                if severity == ErrorSeverity.TRANSIENT:
+                    print(f"  ⚠️  {source_name}: erreur réseau temporaire - {e}")
+                elif severity == ErrorSeverity.RECOVERABLE:
+                    print(f"  🔐 {source_name}: erreur d'auth - {e}")
+                else:
+                    print(f"  ❌ {source_name}: {e}")
+                    logger.error(f"Erreur source {source_name}: {e}")
         
         return all_tasks
     
@@ -127,30 +168,52 @@ class KanbanPrinter:
         """
         results = []
         emails_processed = 0
+        emails_skipped = 0
         tasks_from_emails = 0
         skipped_already_printed = 0
         
         for task in tasks:
-            # Vérifier si la tâche a déjà été imprimée (avant traitement LLM)
-            if self.skip_printed and self.db.is_already_printed(task.content_hash):
-                skipped_already_printed += 1
-                continue
-            
-            # Pour les emails, extraire les vraies tâches avec le LLM
+            # Pour les emails, vérifier si déjà traité AVANT d'appeler le LLM
             if task.source.startswith("gmail") or task.source.startswith("email"):
+                # Extraire l'ID Gmail depuis raw_data ou l'ID de la tâche
+                gmail_id = None
+                if task.raw_data:
+                    gmail_id = task.raw_data.get("gmail_id")
+                if not gmail_id:
+                    # Essayer d'extraire depuis l'ID (format: gmail-account-id)
+                    parts = task.id.split("-")
+                    if len(parts) >= 3:
+                        gmail_id = parts[-1]
+                
+                # Vérifier si cet email a déjà été traité
+                if gmail_id and self.skip_printed and self.db.is_source_processed(task.source, gmail_id):
+                    emails_skipped += 1
+                    continue
+                
                 if self.use_llm and self.parser.is_configured:
                     emails_processed += 1
                     extracted = self.parser.extract_tasks_from_email(task)
+                    
+                    # Marquer l'email comme traité (même s'il n'a généré aucune tâche)
+                    if gmail_id:
+                        self.db.mark_source_processed(
+                            source=task.source,
+                            source_id=gmail_id,
+                            original_title=task.title,
+                            tasks_extracted=len(extracted)
+                        )
+                    
                     for extracted_task, scoring in extracted:
-                        # Vérifier aussi les tâches extraites d'emails
-                        if self.skip_printed and self.db.is_already_printed(extracted_task.content_hash):
-                            skipped_already_printed += 1
-                            continue
                         if scoring["score"] >= self.print_threshold:
                             extracted_task.priority = scoring["priority"]
                             results.append((extracted_task, scoring))
                             tasks_from_emails += 1
                 # Sans LLM, ignorer les emails (pas de conversion 1:1)
+                continue
+            
+            # Pour les autres sources (non-email), vérifier si déjà imprimé
+            if self.skip_printed and self.db.is_already_printed(task.content_hash):
+                skipped_already_printed += 1
                 continue
             
             # Pour les autres sources, scoring normal
@@ -163,8 +226,8 @@ class KanbanPrinter:
                 task.priority = scoring["priority"]
                 results.append((task, scoring))
         
-        if emails_processed > 0:
-            print(f"  📧 {emails_processed} emails analysés → {tasks_from_emails} tâches extraites")
+        if emails_processed > 0 or emails_skipped > 0:
+            print(f"  📧 {emails_processed} emails analysés, {emails_skipped} déjà traités → {tasks_from_emails} tâches extraites")
         
         if skipped_already_printed > 0:
             print(f"  ⏭️  {skipped_already_printed} tâches déjà imprimées (ignorées)")
@@ -327,6 +390,165 @@ class KanbanPrinter:
         
         if saved > 0:
             print(f"  💾 {saved} tâches enregistrées en base")
+    
+    def run_daemon(
+        self,
+        interval: int = 300,
+        auto_print: bool = False,
+        max_iterations: Optional[int] = None
+    ) -> None:
+        """
+        Exécute le programme en mode daemon (boucle continue).
+        
+        Args:
+            interval: Intervalle entre les vérifications (en secondes, défaut: 5 min)
+            auto_print: Imprimer automatiquement sans confirmation
+            max_iterations: Nombre max d'itérations (None = infini)
+        """
+        print("\n" + "=" * 50)
+        print("🔄 KANBANPRINTER - MODE DAEMON")
+        print("=" * 50)
+        print(f"  Intervalle: {interval}s ({interval // 60} min)")
+        print(f"  Auto-print: {'Oui' if auto_print else 'Non'}")
+        print(f"  Seuil: {self.print_threshold}/100")
+        print("  Ctrl+C pour arrêter")
+        print("=" * 50)
+        
+        # Gestionnaire de signal pour arrêt propre
+        self._running = True
+        
+        def signal_handler(signum, frame):
+            print("\n\n🛑 Arrêt demandé...")
+            self._running = False
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        iteration = 0
+        total_printed = 0
+        errors_count = 0
+        
+        while self._running:
+            iteration += 1
+            
+            if max_iterations and iteration > max_iterations:
+                print(f"\n✅ Nombre max d'itérations atteint ({max_iterations})")
+                break
+            
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n{'─' * 50}")
+            print(f"🕐 [{timestamp}] Itération #{iteration}")
+            print(f"{'─' * 50}")
+            
+            try:
+                # Exécuter le cycle
+                stats = self._run_cycle(auto_print=auto_print)
+                total_printed += stats.get("printed", 0)
+                
+                # Résumé de l'itération
+                print(f"\n📊 Cycle #{iteration}: {stats['filtered_tasks']} nouvelles tâches, {stats['printed']} imprimées")
+                
+            except Exception as e:
+                errors_count += 1
+                logger.error(f"Erreur cycle #{iteration}: {e}")
+                print(f"\n❌ Erreur: {e}")
+                
+                # Si trop d'erreurs consécutives, augmenter le délai
+                if errors_count >= 3:
+                    extra_wait = min(errors_count * 60, 600)  # Max 10 min de plus
+                    print(f"  ⏳ Trop d'erreurs, attente supplémentaire de {extra_wait}s")
+                    time.sleep(extra_wait)
+            
+            # Réinitialiser le compteur d'erreurs après un succès
+            if errors_count > 0 and stats.get("total_tasks", 0) > 0:
+                errors_count = 0
+            
+            # Afficher l'état des sources
+            health_summary = health_monitor.get_summary()
+            unhealthy = [n for n, h in health_summary.items() if not h["healthy"]]
+            if unhealthy:
+                print(f"  ⚠️  Sources en échec: {', '.join(unhealthy)}")
+            
+            # Attendre avant le prochain cycle
+            if self._running:
+                next_run = datetime.now().timestamp() + interval
+                print(f"\n💤 Prochaine vérification dans {interval}s...")
+                
+                # Attendre par petits intervalles pour pouvoir réagir aux signaux
+                while self._running and time.time() < next_run:
+                    time.sleep(min(5, interval))
+        
+        # Résumé final
+        print("\n" + "=" * 50)
+        print("📊 RÉSUMÉ FINAL")
+        print("=" * 50)
+        print(f"  Itérations: {iteration}")
+        print(f"  Total imprimé: {total_printed}")
+        print(f"  Erreurs: {errors_count}")
+        
+        db_stats = self.db.get_stats()
+        print(f"  En base: {db_stats['total']} tâches")
+        print("=" * 50)
+    
+    def _run_cycle(self, auto_print: bool = False) -> dict:
+        """
+        Exécute un cycle du daemon (sans les bannières).
+        
+        Args:
+            auto_print: Imprimer automatiquement sans confirmation
+            
+        Returns:
+            Statistiques du cycle
+        """
+        stats = {
+            "total_tasks": 0,
+            "filtered_tasks": 0,
+            "printed": 0,
+        }
+        
+        # 1. Récupérer les tâches
+        print("📥 Récupération des tâches...")
+        if not self.sources:
+            print("  ⚠️ Aucune source configurée")
+            return stats
+        
+        all_tasks = self.fetch_all_tasks()
+        stats["total_tasks"] = len(all_tasks)
+        
+        if not all_tasks:
+            print("  Aucune tâche récupérée")
+            return stats
+        
+        # 2. Analyser et filtrer
+        print(f"🧠 Analyse (seuil: {self.print_threshold}/100)...")
+        to_print = self.analyze_and_filter(all_tasks)
+        stats["filtered_tasks"] = len(to_print)
+        
+        if not to_print:
+            print("  Rien de nouveau à imprimer")
+            return stats
+        
+        # 3. Afficher les tâches trouvées
+        print(f"🎯 À imprimer: {len(to_print)} tâches")
+        for task, scoring in to_print:
+            print(f"  [{scoring['score']:3d}] {task.priority_symbol} {task.title}")
+        
+        # 4. Générer et imprimer
+        print("🖼️  Génération des étiquettes...")
+        image_paths = self.generate_labels(to_print)
+        
+        if auto_print:
+            print("🖨️  Impression automatique...")
+            stats["printed"] = self.print_labels(image_paths)
+            if stats["printed"] > 0:
+                self._save_printed_tasks(to_print[:stats["printed"]])
+                print(f"  ✅ {stats['printed']} étiquettes imprimées")
+        else:
+            print(f"  📋 {len(image_paths)} étiquettes générées (auto-print désactivé)")
+            # En mode non-auto, on enregistre quand même pour éviter de regénérer
+            self._save_printed_tasks(to_print)
+        
+        return stats
 
 
 def main():
@@ -340,6 +562,10 @@ Exemples:
   python main.py --google-tasks --gmail
   python main.py --gmail perso --gmail pro --threshold 80
   python main.py --dry-run --show-all
+  
+Mode daemon (arrière-plan):
+  python main.py --gmail pro --daemon
+  python main.py --gmail pro --daemon --interval 600 --auto-print
         """
     )
     
@@ -405,6 +631,29 @@ Exemples:
         help="Afficher les statistiques de la base de données et quitter"
     )
     
+    # Mode daemon
+    parser.add_argument(
+        "--daemon", "-d",
+        action="store_true",
+        help="Mode daemon: tourne en arrière-plan avec vérifications périodiques"
+    )
+    parser.add_argument(
+        "--interval", "-i",
+        type=int,
+        default=300,
+        help="Intervalle entre les vérifications en mode daemon (secondes, défaut: 300 = 5 min)"
+    )
+    parser.add_argument(
+        "--auto-print",
+        action="store_true",
+        help="En mode daemon, imprimer automatiquement sans confirmation"
+    )
+    parser.add_argument(
+        "--health",
+        action="store_true",
+        help="Afficher l'état de santé des sources et quitter"
+    )
+    
     args = parser.parse_args()
     
     # Si demande de stats seulement
@@ -457,8 +706,14 @@ Exemples:
             print("   Utilisez: --json, --google-tasks, ou --gmail")
             sys.exit(1)
     
-    # Exécuter
-    app.run(dry_run=args.dry_run, show_all=args.show_all)
+    # Mode daemon ou exécution unique
+    if args.daemon:
+        app.run_daemon(
+            interval=args.interval,
+            auto_print=args.auto_print
+        )
+    else:
+        app.run(dry_run=args.dry_run, show_all=args.show_all)
 
 
 if __name__ == "__main__":

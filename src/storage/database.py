@@ -52,6 +52,7 @@ class TaskDatabase:
         conn = self._get_connection()
         cursor = conn.cursor()
         
+        # Table des tâches imprimées
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS printed_tasks (
                 task_hash TEXT PRIMARY KEY,
@@ -65,6 +66,18 @@ class TaskDatabase:
             )
         """)
         
+        # Table des emails/sources déjà traités (pour éviter de re-appeler le LLM)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS processed_sources (
+                source_hash TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                original_title TEXT NOT NULL,
+                tasks_extracted INTEGER DEFAULT 0,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         # Index pour recherches par source
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_source ON printed_tasks(source)
@@ -73,6 +86,11 @@ class TaskDatabase:
         # Index pour recherches par date
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_printed_at ON printed_tasks(printed_at)
+        """)
+        
+        # Index pour processed_sources
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_processed_source ON processed_sources(source)
         """)
         
         conn.commit()
@@ -111,6 +129,86 @@ class TaskDatabase:
         # Calculer le hash
         hash_obj = hashlib.sha256(content.encode("utf-8"))
         return hash_obj.hexdigest()[:16]
+    
+    @staticmethod
+    def compute_source_hash(source: str, source_id: str) -> str:
+        """
+        Calcule un hash unique pour identifier une source (email, etc.).
+        
+        Args:
+            source: Nom de la source (gmail:pro, gmail:perso, etc.)
+            source_id: ID unique dans la source (gmail_id, task_id, etc.)
+            
+        Returns:
+            Hash SHA256 tronqué à 16 caractères
+        """
+        content = f"{source}|{source_id}"
+        content = content.lower().strip()
+        hash_obj = hashlib.sha256(content.encode("utf-8"))
+        return hash_obj.hexdigest()[:16]
+    
+    def is_source_processed(self, source: str, source_id: str) -> bool:
+        """
+        Vérifie si une source (email, etc.) a déjà été traitée.
+        
+        Args:
+            source: Nom de la source
+            source_id: ID dans la source
+            
+        Returns:
+            True si la source a déjà été traitée
+        """
+        source_hash = self.compute_source_hash(source, source_id)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT 1 FROM processed_sources WHERE source_hash = ?",
+            (source_hash,)
+        )
+        
+        return cursor.fetchone() is not None
+    
+    def mark_source_processed(
+        self,
+        source: str,
+        source_id: str,
+        original_title: str,
+        tasks_extracted: int = 0
+    ) -> bool:
+        """
+        Marque une source comme traitée.
+        
+        Args:
+            source: Nom de la source
+            source_id: ID dans la source
+            original_title: Titre original (sujet email, etc.)
+            tasks_extracted: Nombre de tâches extraites
+            
+        Returns:
+            True si l'insertion a réussi
+        """
+        source_hash = self.compute_source_hash(source, source_id)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                INSERT OR REPLACE INTO processed_sources 
+                (source_hash, source, source_id, original_title, tasks_extracted, processed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                source_hash,
+                source,
+                source_id,
+                original_title,
+                tasks_extracted,
+                datetime.now()
+            ))
+            conn.commit()
+            return True
+        except Exception:
+            return False
     
     def is_already_printed(self, task_hash: str) -> bool:
         """
