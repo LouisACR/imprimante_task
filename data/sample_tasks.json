@@ -1,0 +1,40 @@
+{
+  "tasks": [
+    {
+      "id": "task-001",
+      "title": "Finaliser le rapport Q4",
+      "description": "Inclure les métriques de vente et les projections pour 2026",
+      "priority": "high",
+      "category": "Travail",
+      "due_date": "2025-12-15"
+    },
+    {
+      "id": "task-002",
+      "title": "Appeler le dentiste",
+      "description": "Prendre RDV pour contrôle annuel",
+      "priority": "medium",
+      "category": "Perso",
+      "due_date": "2025-12-20"
+    },
+    {
+      "id": "task-003",
+      "title": "Acheter cadeaux Noël",
+      "priority": "urgent",
+      "category": "Perso",
+      "due_date": "2025-12-23"
+    },
+    {
+      "id": "task-004",
+      "title": "Réviser le code PR #42",
+      "description": "Feature: nouveau module de notification",
+      "priority": "medium",
+      "category": "Dev"
+    },
+    {
+      "id": "task-005",
+      "title": "Faire les courses",
+      "priority": "low",
+      "category": "Perso"
+    }
+  ]
+}

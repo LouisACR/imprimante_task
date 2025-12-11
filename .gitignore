@@ -1,0 +1,11 @@
+/output
+
+__pycache__/
+
+.env
+
+google_credentials.json
+
+*.pickle
+
+*.db

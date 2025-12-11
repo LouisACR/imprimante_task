@@ -1,0 +1,27 @@
+# KanbanPrinter - Dépendances Python
+# Installation: pip install -r requirements.txt
+
+# Core
+python-dotenv>=1.0.0
+
+# Image generation
+Pillow>=10.0.0
+
+# Windows printing
+pywin32>=306
+
+# OpenAI API
+openai>=1.0.0
+
+# Google Tasks API
+google-api-python-client>=2.100.0
+google-auth-httplib2>=0.1.0
+google-auth-oauthlib>=1.1.0
+
+# Utilities
+pydantic>=2.0.0      # Data validation
+httpx>=0.25.0        # HTTP client (fallback)
+
+# Development
+pytest>=7.4.0
+black>=23.0.0
